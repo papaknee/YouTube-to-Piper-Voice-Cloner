@@ -53,14 +53,21 @@ class PipelineError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Piper voices from YouTube segments")
-    parser.add_argument("--input-csv", default="youtube-inputs.csv", help="Input CSV path")
+    parser.add_argument("--input-csv", default="audio-samples-in/sample.csv", help="Input CSV path")
     parser.add_argument("--espeak-voice", default="en-us", help="Piper espeak voice")
     parser.add_argument("--language-code", default="en", help="Language code for exported model name")
     parser.add_argument("--sample-rate", type=int, default=22050, help="Audio sample rate")
     parser.add_argument("--batch-size", type=int, default=32, help="Piper training batch size")
-    parser.add_argument("--checkpoint-path", default="", help="Optional Piper checkpoint path")
+    parser.add_argument("--checkpoint-path", default="", help="Optional Piper checkpoint path (recommended for faster convergence)")
     parser.add_argument("--whisper-model", default="base", help="faster-whisper model name")
     parser.add_argument("--transcribe-device", default="auto", choices=["auto", "cpu", "cuda"], help="faster-whisper device")
+    parser.add_argument(
+        "--trainer-accelerator",
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="PyTorch Lightning accelerator passed to piper.train",
+    )
+    parser.add_argument("--trainer-devices", default="1", help="PyTorch Lightning devices value passed to piper.train")
     parser.add_argument("--min-duration", type=float, default=1.5, help="Minimum clip duration in seconds")
     parser.add_argument("--max-duration", type=float, default=60.0, help="Maximum clip duration in seconds")
     parser.add_argument("--root-dir", default=".", help="Repository root")
@@ -91,7 +98,16 @@ def parse_requests(csv_path: Path) -> List[ClipRequest]:
 
     requests: List[ClipRequest] = []
     with csv_path.open("r", encoding="utf-8", newline="") as file_handle:
-        reader = csv.DictReader(file_handle)
+        sample = file_handle.read(4096)
+        file_handle.seek(0)
+
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t")
+            delimiter = dialect.delimiter
+        except csv.Error:
+            delimiter = ","
+
+        reader = csv.DictReader(file_handle, delimiter=delimiter)
         if reader.fieldnames is None:
             raise PipelineError("CSV file is empty")
 
@@ -340,6 +356,10 @@ def train_and_export_voice(
         str(args.batch_size),
         "--trainer.default_root_dir",
         str(train_root),
+        "--trainer.accelerator",
+        args.trainer_accelerator,
+        "--trainer.devices",
+        str(args.trainer_devices),
     ]
 
     if args.checkpoint_path:
@@ -396,6 +416,18 @@ def main() -> int:
         ensure_command("yt-dlp")
         ensure_command("ffmpeg")
         ensure_command("ffprobe")
+
+        if args.trainer_accelerator == "gpu" and shutil.which("nvidia-smi") is None:
+            raise PipelineError(
+                "--trainer-accelerator gpu was requested, but nvidia-smi was not found. "
+                "Install NVIDIA drivers/CUDA or run with --trainer-accelerator cpu."
+            )
+
+        print(
+            "Training device configuration: "
+            f"accelerator={args.trainer_accelerator}, devices={args.trainer_devices}, "
+            f"whisper_device={args.transcribe_device}"
+        )
 
         requests = parse_requests((root_dir / args.input_csv).resolve())
         grouped = group_by_voice(requests)
