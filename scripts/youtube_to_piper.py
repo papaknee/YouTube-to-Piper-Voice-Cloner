@@ -167,10 +167,33 @@ def parse_requests(csv_path: Path) -> List[ClipRequest]:
     return requests
 
 
-def run_command(cmd: Sequence[str], *, dry_run: bool, cwd: Path | None = None, log_file: Path | None = None) -> str:
+def run_command(
+    cmd: Sequence[str],
+    *,
+    dry_run: bool,
+    cwd: Path | None = None,
+    log_file: Path | None = None,
+    stream_output: bool = False,
+) -> str:
     printable = " ".join(cmd)
     print(f"$ {printable}")
     if dry_run:
+        return ""
+
+    if stream_output:
+        # Let stdout/stderr flow directly to the terminal so the user can
+        # monitor progress (e.g. training loss). Output is not captured for
+        # the log file in this mode.
+        if log_file:
+            with log_file.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n$ {printable}\n")
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise PipelineError(f"Command failed ({result.returncode}): {printable}")
         return ""
 
     process = subprocess.run(
@@ -361,7 +384,9 @@ def train_and_export_voice(
         "--data.config_path",
         str(config_path),
         "--data.batch_size",
-        str(args.batch_size),
+        str(min(args.batch_size, len(clips))),
+        "--data.num_test_examples",
+        "0",
         "--trainer.default_root_dir",
         str(train_root),
         "--trainer.accelerator",
@@ -375,12 +400,12 @@ def train_and_export_voice(
     else:
         print("Warning: --checkpoint-path not provided. Piper recommends fine-tuning from an existing checkpoint.")
 
-    run_command(train_cmd, dry_run=args.dry_run, cwd=root_dir, log_file=log_file)
+    run_command(train_cmd, dry_run=args.dry_run, cwd=root_dir, log_file=log_file, stream_output=True)
 
     if args.dry_run:
         checkpoint_path = Path(args.checkpoint_path) if args.checkpoint_path else Path("/tmp/dry-run.ckpt")
     else:
-        checkpoint_path = Path(args.checkpoint_path) if args.checkpoint_path else find_latest_checkpoint(train_root)
+        checkpoint_path = find_latest_checkpoint(train_root)
 
     model_name = f"{args.language_code}-{voice_name}-medium.onnx"
     model_path = export_dir / model_name
