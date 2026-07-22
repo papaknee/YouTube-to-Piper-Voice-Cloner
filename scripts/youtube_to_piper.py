@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-duration", type=float, default=1.5, help="Minimum clip duration in seconds")
     parser.add_argument("--max-duration", type=float, default=60.0, help="Maximum clip duration in seconds")
     parser.add_argument("--root-dir", default=".", help="Repository root")
+    parser.add_argument("--piper-dir", default="~/piper1-gpl", help="Path to the piper1-gpl install (contains .venv/)")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without running commands")
     return parser.parse_args()
 
@@ -333,8 +334,15 @@ def train_and_export_voice(
     clips_dir = clips[0].wav_path.parent
     build_metadata_file(clips, metadata_path)
 
+    piper_python = Path(args.piper_dir).expanduser() / ".venv" / "bin" / "python"
+    if not piper_python.exists():
+        raise PipelineError(
+            f"Piper python not found at {piper_python}. "
+            "Install piper1-gpl per the README or pass --piper-dir."
+        )
+
     train_cmd = [
-        sys.executable,
+        str(piper_python),
         "-m",
         "piper.train",
         "fit",
@@ -377,7 +385,7 @@ def train_and_export_voice(
     model_name = f"{args.language_code}-{voice_name}-medium.onnx"
     model_path = export_dir / model_name
     export_cmd = [
-        sys.executable,
+        str(piper_python),
         "-m",
         "piper.train.export_onnx",
         "--checkpoint",
