@@ -160,3 +160,17 @@ voice-files-out/
 ```
 
 The two files in `exports/` are what you load into a Piper-compatible TTS application.
+
+---
+
+## Voice Tester
+
+After you have at least one exported voice in `voice-files-out/<voice>/exports/`, run the tiny local tester:
+
+```bash
+./test_voice.sh
+```
+
+It opens a local browser page where you can pick a voice, type text, and press Play to hear the result.
+
+The app auto-discovers any `*.onnx` file under `voice-files-out/*/exports/` and uses the matching `*.onnx.json` config when present.
