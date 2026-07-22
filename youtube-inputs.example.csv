@@ -1,0 +1,4 @@
+voice_name,youtube_url,start_timestamp,end_timestamp
+alice,https://www.youtube.com/watch?v=dQw4w9WgXcQ,00:00:10,00:00:25
+alice,https://www.youtube.com/watch?v=dQw4w9WgXcQ,00:00:30,00:00:45
+bob,https://www.youtube.com/watch?v=aqz-KE-bpKQ,00:00:05,00:00:20

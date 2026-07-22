@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local virtual environment
+.venv/
+
+# Pipeline runtime artifacts
+audio-samples-in/raw-youtube/
+audio-samples-in/clips/
+voice-files-out/**
+
+# Keep directory placeholders
+!audio-samples-in/.gitkeep
+!voice-files-out/.gitkeep
