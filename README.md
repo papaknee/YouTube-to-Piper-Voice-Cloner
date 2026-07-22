@@ -1,47 +1,46 @@
-# Voice-Cloner YouTube Training Pipeline
+# Voice-Cloner
 
-This repository now supports training Piper voices from a YouTube-only CSV input.
+Clone a voice from YouTube videos. Point this tool at one or more YouTube clips, and it downloads, trims, and trains a text-to-speech voice model you can use offline.
 
-## Input CSV
+---
 
-Use [audio-samples-in/sample.csv](audio-samples-in/sample.csv) as the example input file.
+## Overview
 
-Header:
+You provide a CSV file listing YouTube URLs and timestamps. The pipeline:
 
-```csv
-voice_name,youtube_url,start_timestamp,end_timestamp
-```
+1. Downloads each clip from YouTube
+2. Trims it to the timestamps you specified
+3. Transcribes the audio
+4. Trains a [Piper](https://github.com/OHF-Voice/piper1-gpl) voice model
+5. Exports a `.onnx` voice file you can load into any Piper-compatible TTS app
 
-Delimiter:
+---
 
-- Comma-delimited CSV is supported.
-- Tab-delimited files are also supported (your current sample file format).
+## One-Time Setup
 
-- `voice_name`: name of the output voice/model group.
-- `youtube_url`: full YouTube URL.
-- `start_timestamp`: clip start in `HH:MM:SS`.
-- `end_timestamp`: clip end in `HH:MM:SS`.
+Do these steps once before you use the tool for the first time.
 
-You can include multiple rows and multiple `voice_name` values. The pipeline trains one voice per `voice_name`.
-
-## Prerequisites
-
-Install system dependencies:
+### Step 1 — Install system packages
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake ninja-build ffmpeg espeak-ng
 ```
 
-Install Python dependencies in your environment:
+### Step 2 — Install Python dependencies for this project
+
+Run this from inside the Voice-Cloner folder:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Install Piper training code as described in the upstream guide:
+### Step 3 — Install the Piper training tool (outside this folder)
+
+Piper is a separate training engine. Install it in your home directory so it does not clutter this project:
 
 ```bash
+cd ~
 git clone https://github.com/OHF-Voice/piper1-gpl.git
 cd piper1-gpl
 python3 -m venv .venv
@@ -51,91 +50,113 @@ python3 -m pip install -e '.[train]'
 python3 setup.py build_ext --inplace
 ```
 
+> After this, `~/piper1-gpl` holds the Piper engine. You do not need to touch it again.
+
+### Step 4 — (Recommended) Download a checkpoint
+
+A checkpoint is a pre-trained starting point that makes training faster and produces better quality voices. Without one, training from scratch takes much longer.
+
+- Browse checkpoints: https://huggingface.co/datasets/rhasspy/piper-checkpoints
+- Download a `medium` checkpoint for your language (e.g. `en_US-medium.ckpt`) and save it somewhere easy to find, such as `~/piper-checkpoints/`.
+
+---
+
+## Prepare Your Input CSV
+
+Edit [audio-samples-in/sample.csv](audio-samples-in/sample.csv) with your YouTube links.
+
+**Column reference:**
+
+| Column | What to put |
+|---|---|
+| `voice_name` | A short name for the voice you are training (e.g. `alice`) |
+| `youtube_url` | Full YouTube URL |
+| `start_timestamp` | Where to start the clip — format `HH:MM:SS` |
+| `end_timestamp` | Where to end the clip — format `HH:MM:SS` |
+
+You can add as many rows as you want. Rows that share the same `voice_name` are combined into one voice model.
+
+Both comma-delimited and tab-delimited CSV files are supported.
+
+---
+
 ## Run
 
-```bash
-chmod +x train_voice.sh
-./train_voice.sh \
-  --input-csv audio-samples-in/sample.csv \
-  --espeak-voice en-us \
-  --language-code en \
-  --sample-rate 22050 \
-  --batch-size 32 \
-  --checkpoint-path /path/to/piper-medium.ckpt \
-  --trainer-accelerator gpu \
-  --trainer-devices 1
-```
+### Try a dry run first (no downloads, no training)
 
-### Dry run
+This checks your CSV and prints what the pipeline would do, without doing anything:
 
 ```bash
 ./train_voice.sh --input-csv audio-samples-in/sample.csv --dry-run
 ```
 
-## Checkpoints
-
-Using `--checkpoint-path` is strongly recommended by the Piper training guide because it usually:
-
-- Converges faster than training from scratch.
-- Produces better voice quality with less data.
-- Reduces the risk of unstable training early in the run.
-
-Where to find checkpoints:
-
-- Piper checkpoint dataset: https://huggingface.co/datasets/rhasspy/piper-checkpoints
-- Choose a `medium` checkpoint unless you plan to tune model settings for other sizes.
-
-Example:
+### Run training
 
 ```bash
 ./train_voice.sh \
   --input-csv audio-samples-in/sample.csv \
-  --checkpoint-path /models/en_US-medium.ckpt
+  --checkpoint-path ~/piper-checkpoints/en_US-medium.ckpt
 ```
 
-## GPU Checks And Usage
+That is the minimum you need. The pipeline uses sensible defaults for everything else.
 
-Check whether your machine has an NVIDIA GPU and driver:
+### All options
+
+| Option | Default | Description |
+|---|---|---|
+| `--input-csv` | *(required)* | Path to your CSV file |
+| `--checkpoint-path` | *(none)* | Path to a Piper checkpoint — strongly recommended |
+| `--espeak-voice` | `en-us` | eSpeak voice code for your language |
+| `--language-code` | `en` | Language code used in output filenames |
+| `--sample-rate` | `22050` | Audio sample rate in Hz |
+| `--batch-size` | `32` | Training batch size — lower this if you run out of memory |
+| `--trainer-accelerator` | `cpu` | `cpu` or `gpu` |
+| `--trainer-devices` | `1` | Number of GPUs to use |
+| `--dry-run` | *(off)* | Preview actions without running them |
+
+---
+
+## GPU Usage
+
+If your machine has an NVIDIA GPU, training will be significantly faster. First check that the driver is working:
 
 ```bash
 nvidia-smi
 ```
 
-If this shows a GPU table, CUDA driver is available. If command is missing/fails, use CPU mode or install drivers.
-
-Run training on GPU explicitly:
+If a GPU table appears, add these flags to your run command:
 
 ```bash
 ./train_voice.sh \
   --input-csv audio-samples-in/sample.csv \
+  --checkpoint-path ~/piper-checkpoints/en_US-medium.ckpt \
   --trainer-accelerator gpu \
   --trainer-devices 1
 ```
 
-How to confirm GPU is being used:
-
-- The pipeline prints selected device config at startup.
-- `piper.train` command in logs includes `--trainer.accelerator gpu`.
-- During training, watch GPU utilization in another terminal:
+To watch GPU utilization while training runs (in a second terminal):
 
 ```bash
 watch -n 1 nvidia-smi
 ```
 
-If GPU utilization stays at 0% for the full training run, verify your PyTorch/CUDA environment and retry.
+---
 
 ## Output
 
-For each `voice_name`, the pipeline writes files under:
+Finished voice files are written to the `voice-files-out/` folder inside this project. Nothing is written outside of this folder.
 
-- `voice-files-out/<voice_name>/metadata.csv`
-- `voice-files-out/<voice_name>/config.json`
-- `voice-files-out/<voice_name>/train/...`
-- `voice-files-out/<voice_name>/exports/<language>-<voice_name>-medium.onnx`
-- `voice-files-out/<voice_name>/exports/<language>-<voice_name>-medium.onnx.json`
+For each `voice_name` in your CSV:
 
-## Notes
+```
+voice-files-out/
+  <voice_name>/
+    exports/
+      <language>-<voice_name>-medium.onnx        ← the voice model
+      <language>-<voice_name>-medium.onnx.json   ← config for the model
+    metadata.csv
+    config.json
+    train/
+```
 
-- `--checkpoint-path` is optional, but strongly recommended by Piper for faster convergence.
-- Timestamps must be valid and `end_timestamp` must be greater than `start_timestamp`.
-- Clips are normalized to mono WAV at the selected sample rate.
+The two files in `exports/` are what you load into a Piper-compatible TTS application.
