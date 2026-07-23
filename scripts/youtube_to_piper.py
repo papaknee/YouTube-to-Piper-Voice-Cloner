@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         "--trusted-checkpoint",
         action="store_true",
         help=(
-            "Trust checkpoint pickle contents and disable PyTorch weights-only safe loading for Piper subprocesses. "
+            "Treat --checkpoint-path as a trusted warmstart checkpoint for compatibility with older Piper checkpoints. "
             "Use only with trusted checkpoint sources."
         ),
     )
@@ -83,12 +83,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root-dir", default=".", help="Repository root")
     parser.add_argument("--piper-dir", default="~/piper1-gpl", help="Path to the piper1-gpl install (contains .venv/)")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without running commands")
+    parser.add_argument(
+        "--export-only",
+        action="store_true",
+        help="Skip training and export the latest checkpoint already present under the voice train directory",
+    )
     return parser.parse_args()
 
 
-def ensure_command(command: str) -> None:
-    if shutil.which(command) is None:
+def resolve_command_path(command: str, root_dir: Path | None = None) -> str | None:
+    if command.startswith("/"):
+        return command
+
+    if root_dir is not None:
+        local_bin = root_dir / ".venv" / "bin" / command
+        if local_bin.exists() and os.access(local_bin, os.X_OK):
+            return str(local_bin)
+
+    if sys.prefix and sys.prefix != sys.base_prefix:
+        venv_bin = Path(sys.prefix) / "bin" / command
+        if venv_bin.exists() and os.access(venv_bin, os.X_OK):
+            return str(venv_bin)
+
+    return shutil.which(command)
+
+
+def ensure_command(command: str, root_dir: Path | None = None) -> str:
+    resolved = resolve_command_path(command, root_dir)
+    if resolved is None:
         raise PipelineError(f"Required command not found: {command}")
+    return resolved
 
 
 def parse_timestamp(raw_value: str) -> int:
@@ -184,9 +208,15 @@ def run_command(
     cwd: Path | None = None,
     log_file: Path | None = None,
     stream_output: bool = False,
-    env: Dict[str, str] | None = None,
 ) -> str:
-    printable = " ".join(cmd)
+    resolved_cmd = list(cmd)
+    executable = resolved_cmd[0] if resolved_cmd else ""
+    if executable and not executable.startswith("/") and "/" not in executable:
+        resolved_executable = resolve_command_path(executable, cwd)
+        if resolved_executable is not None:
+            resolved_cmd[0] = resolved_executable
+
+    printable = " ".join(resolved_cmd)
     print(f"$ {printable}")
     if dry_run:
         return ""
@@ -199,9 +229,8 @@ def run_command(
             with log_file.open("a", encoding="utf-8") as handle:
                 handle.write(f"\n$ {printable}\n")
         result = subprocess.run(
-            cmd,
+            resolved_cmd,
             cwd=str(cwd) if cwd else None,
-            env={**os.environ, **env} if env else None,
             check=False,
         )
         if result.returncode != 0:
@@ -209,9 +238,8 @@ def run_command(
         return ""
 
     process = subprocess.run(
-        cmd,
+        resolved_cmd,
         cwd=str(cwd) if cwd else None,
-        env={**os.environ, **env} if env else None,
         check=False,
         text=True,
         capture_output=True,
@@ -340,6 +368,12 @@ def find_latest_checkpoint(search_dir: Path) -> Path:
     return checkpoints[-1]
 
 
+def save_checkpoint_copy(checkpoint_path: Path, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(checkpoint_path, destination)
+    return destination
+
+
 def build_metadata_file(outputs: Iterable[ClipOutput], metadata_path: Path) -> None:
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     rows: List[str] = []
@@ -410,88 +444,46 @@ def train_and_export_voice(
         str(args.max_epochs),
     ]
 
-    if args.checkpoint_path:
-        train_cmd.extend(["--ckpt_path", args.checkpoint_path])
-    else:
-        print("Warning: --checkpoint-path not provided. Piper recommends fine-tuning from an existing checkpoint.")
-
-    trusted_checkpoint_env: Dict[str, str] | None = None
-    if args.trusted_checkpoint:
-        if not args.checkpoint_path:
-            print("Warning: --trusted-checkpoint was set, but --checkpoint-path is empty. Flag will be ignored.")
+    if not args.export_only:
+        if args.checkpoint_path:
+            if args.trusted_checkpoint:
+                # Older checkpoints can fail CLI hyperparameter parsing when used as
+                # ckpt_path. Warmstart loads model weights and skips resume parsing.
+                train_cmd.extend(["--model.warmstart_ckpt", args.checkpoint_path])
+                print(
+                    "Warning: trusted checkpoint mode enabled. "
+                    "Using Piper warmstart checkpoint loading for compatibility with older checkpoints. "
+                    "Use only for trusted checkpoint sources."
+                )
+            else:
+                train_cmd.extend(["--ckpt_path", args.checkpoint_path])
         else:
-            # PyTorch >=2.6 defaults to weights_only checkpoint loading; older
-            # checkpoint files can require full pickle loading.
-            trusted_checkpoint_env = {"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
-            train_cmd = [
-                str(piper_python),
-                "-c",
-                (
-                    "import runpy, sys, torch; "
-                    "_orig_torch_load = torch.load; "
-                    "def _trusted_load(*args, **kwargs): "
-                    " kwargs['weights_only'] = False; "
-                    " return _orig_torch_load(*args, **kwargs); "
-                    "torch.load = _trusted_load; "
-                    "sys.argv=['piper.train'] + sys.argv[1:]; "
-                    "runpy.run_module('piper.train.__main__', run_name='__main__')"
-                ),
-                "fit",
-                "--data.voice_name",
-                voice_name,
-                "--data.csv_path",
-                str(metadata_path),
-                "--data.audio_dir",
-                str(clips_dir),
-                "--model.sample_rate",
-                str(args.sample_rate),
-                "--data.espeak_voice",
-                args.espeak_voice,
-                "--data.cache_dir",
-                str(voice_out_dir / "cache"),
-                "--data.config_path",
-                str(config_path),
-                "--data.batch_size",
-                str(min(args.batch_size, len(clips))),
-                "--data.num_test_examples",
-                "0",
-                "--trainer.default_root_dir",
-                str(train_root),
-                "--trainer.accelerator",
-                args.trainer_accelerator,
-                "--trainer.devices",
-                str(args.trainer_devices),
-                "--trainer.max_epochs",
-                str(args.max_epochs),
-                "--ckpt_path",
-                args.checkpoint_path,
-            ]
-            print(
-                "Warning: trusted checkpoint mode enabled. "
-                "Forcing torch.load(weights_only=False) for Piper checkpoint load. "
-                "Use only for trusted checkpoint sources."
-            )
+            if args.trusted_checkpoint:
+                print("Warning: --trusted-checkpoint was set, but --checkpoint-path is empty. Flag will be ignored.")
+            print("Warning: --checkpoint-path not provided. Piper recommends fine-tuning from an existing checkpoint.")
 
-    run_command(
-        train_cmd,
-        dry_run=args.dry_run,
-        cwd=root_dir,
-        log_file=log_file,
-        stream_output=True,
-        env=trusted_checkpoint_env,
-    )
+        run_command(
+            train_cmd,
+            dry_run=args.dry_run,
+            cwd=root_dir,
+            log_file=log_file,
+            stream_output=True,
+        )
+    else:
+        print("Export-only mode: skipping training and reusing the latest checkpoint from the existing run.")
 
     if args.dry_run:
         checkpoint_path = Path(args.checkpoint_path) if args.checkpoint_path else Path("/tmp/dry-run.ckpt")
     else:
         checkpoint_path = find_latest_checkpoint(train_root)
+        stable_checkpoint_path = save_checkpoint_copy(checkpoint_path, voice_out_dir / "latest-checkpoint.ckpt")
+        checkpoint_path = stable_checkpoint_path
 
     model_name = f"{args.language_code}-{voice_name}-medium.onnx"
     model_path = export_dir / model_name
     export_cmd = [
         str(piper_python),
-        "-m",
-        "piper.train.export_onnx",
+        str(root_dir / "scripts" / "piper_export_compat.py"),
         "--checkpoint",
         str(checkpoint_path),
         "--output-file",
@@ -525,9 +517,10 @@ def main() -> int:
     log_file = log_dir / f"pipeline-{timestamp}.log"
 
     try:
-        ensure_command("yt-dlp")
-        ensure_command("ffmpeg")
-        ensure_command("ffprobe")
+        if not args.export_only:
+            ensure_command("yt-dlp", root_dir)
+            ensure_command("ffmpeg", root_dir)
+            ensure_command("ffprobe", root_dir)
 
         if args.trainer_accelerator == "gpu" and shutil.which("nvidia-smi") is None:
             raise PipelineError(

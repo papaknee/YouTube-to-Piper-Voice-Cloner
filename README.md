@@ -106,7 +106,7 @@ That is the minimum you need. The pipeline uses sensible defaults for everything
 |---|---|---|
 | `--input-csv` | *(required)* | Path to your CSV file |
 | `--checkpoint-path` | *(none)* | Path to a Piper checkpoint — strongly recommended |
-| `--trusted-checkpoint` | *(off)* | Trust checkpoint pickle contents and disable PyTorch weights-only safe loading (use only for trusted sources) |
+| `--trusted-checkpoint` | *(off)* | Use `--checkpoint-path` as a trusted warmstart checkpoint for compatibility with older Piper checkpoints |
 | `--espeak-voice` | `en-us` | eSpeak voice code for your language |
 | `--language-code` | `en` | Language code used in output filenames |
 | `--sample-rate` | `22050` | Audio sample rate in Hz |

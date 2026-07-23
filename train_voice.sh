@@ -15,4 +15,6 @@ else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
+export PATH="$ROOT_DIR/.venv/bin:$PATH"
+
 exec "$PYTHON_BIN" "$SCRIPT_PATH" "$@"
