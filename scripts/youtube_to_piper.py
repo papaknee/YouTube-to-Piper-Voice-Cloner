@@ -424,15 +424,15 @@ def create_periodic_checkpoint_config(args: argparse.Namespace, root_dir: Path) 
     if args.checkpoint_every_n_epochs <= 0:
         return None
 
-    keep_last_n = max(1, args.checkpoint_keep_last_n)
     config_text = (
         "trainer:\n"
         "  callbacks:\n"
         "    - class_path: lightning.pytorch.callbacks.ModelCheckpoint\n"
         "      init_args:\n"
         "        monitor: null\n"
-        f"        save_top_k: {keep_last_n}\n"
+        "        save_top_k: -1\n"
         "        save_last: true\n"
+        "        auto_insert_metric_name: false\n"
         f"        every_n_epochs: {args.checkpoint_every_n_epochs}\n"
         "        filename: \"periodic-epoch={epoch}-step={step}\"\n"
     )
@@ -449,6 +449,21 @@ def create_periodic_checkpoint_config(args: argparse.Namespace, root_dir: Path) 
     ) as handle:
         handle.write(config_text)
         return Path(handle.name)
+
+
+def prune_periodic_checkpoints(train_root: Path, keep_last_n: int) -> None:
+    if keep_last_n <= 0:
+        return
+
+    periodic_files = sorted(
+        train_root.rglob("periodic-*.ckpt"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    if len(periodic_files) <= keep_last_n:
+        return
+
+    for path in periodic_files[:-keep_last_n]:
+        path.unlink(missing_ok=True)
 
 
 def train_and_export_voice(
@@ -543,6 +558,9 @@ def train_and_export_voice(
             log_file=log_file,
             stream_output=True,
         )
+
+        if not args.dry_run and args.checkpoint_every_n_epochs > 0:
+            prune_periodic_checkpoints(train_root, args.checkpoint_keep_last_n)
     else:
         print("Export-only mode: skipping training and reusing the latest checkpoint from the existing run.")
 

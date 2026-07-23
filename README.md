@@ -113,7 +113,7 @@ That is the minimum you need. The pipeline uses sensible defaults for everything
 | `--batch-size` | `32` | Training batch size — lower this if you run out of memory |
 | `--max-epochs` | `100` | Maximum training epochs — use `-1` for unlimited |
 | `--checkpoint-every-n-epochs` | `10` | Save an extra periodic checkpoint every N epochs (set `0` to disable) |
-| `--checkpoint-keep-last-n` | `5` | Number of periodic checkpoints to retain |
+| `--checkpoint-keep-last-n` | `5` | Number of periodic checkpoints to retain (older periodic checkpoints are pruned by the pipeline) |
 | `--trainer-accelerator` | `cpu` | `cpu` or `gpu` |
 | `--trainer-devices` | `1` | Number of GPUs to use |
 | `--voice-name` | *(latest checkpoint voice)* | Voice name used by `--export-only`; if omitted, exports the most recently updated checkpoint across voices |
