@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -60,6 +61,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=int, default=22050, help="Audio sample rate")
     parser.add_argument("--batch-size", type=int, default=32, help="Piper training batch size")
     parser.add_argument("--max-epochs", type=int, default=100, help="Maximum training epochs passed to Piper's trainer (use -1 for unlimited)")
+    parser.add_argument(
+        "--checkpoint-every-n-epochs",
+        type=int,
+        default=10,
+        help="Save an extra training checkpoint every N epochs (set 0 to disable periodic extra checkpoints)",
+    )
+    parser.add_argument(
+        "--checkpoint-keep-last-n",
+        type=int,
+        default=5,
+        help="How many periodic checkpoints to keep when periodic checkpointing is enabled",
+    )
     parser.add_argument("--checkpoint-path", default="", help="Optional Piper checkpoint path (recommended for faster convergence)")
     parser.add_argument(
         "--trusted-checkpoint",
@@ -82,11 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-duration", type=float, default=60.0, help="Maximum clip duration in seconds")
     parser.add_argument("--root-dir", default=".", help="Repository root")
     parser.add_argument("--piper-dir", default="~/piper1-gpl", help="Path to the piper1-gpl install (contains .venv/)")
+    parser.add_argument("--voice-name", default="", help="Voice name to export in --export-only mode (defaults to latest available voice checkpoint)")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without running commands")
     parser.add_argument(
         "--export-only",
         action="store_true",
-        help="Skip training and export the latest checkpoint already present under the voice train directory",
+        help="Skip training and export from latest checkpoint (use --voice-name to target a specific voice)",
     )
     return parser.parse_args()
 
@@ -368,6 +382,27 @@ def find_latest_checkpoint(search_dir: Path) -> Path:
     return checkpoints[-1]
 
 
+def find_latest_voice_checkpoint(root_dir: Path) -> tuple[str, Path]:
+    voice_root = root_dir / "voice-files-out"
+    candidates: List[tuple[str, Path]] = []
+
+    if voice_root.exists():
+        for voice_dir in voice_root.iterdir():
+            if not voice_dir.is_dir() or voice_dir.name == "logs":
+                continue
+            train_root = voice_dir / "train"
+            if not train_root.exists():
+                continue
+            for checkpoint in train_root.rglob("*.ckpt"):
+                candidates.append((voice_dir.name, checkpoint))
+
+    if not candidates:
+        raise PipelineError(f"No checkpoint found under: {voice_root}")
+
+    voice_name, checkpoint_path = max(candidates, key=lambda item: item[1].stat().st_mtime)
+    return voice_name, checkpoint_path
+
+
 def save_checkpoint_copy(checkpoint_path: Path, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(checkpoint_path, destination)
@@ -385,12 +420,44 @@ def build_metadata_file(outputs: Iterable[ClipOutput], metadata_path: Path) -> N
     metadata_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
+def create_periodic_checkpoint_config(args: argparse.Namespace, root_dir: Path) -> Path | None:
+    if args.checkpoint_every_n_epochs <= 0:
+        return None
+
+    keep_last_n = max(1, args.checkpoint_keep_last_n)
+    config_text = (
+        "trainer:\n"
+        "  callbacks:\n"
+        "    - class_path: lightning.pytorch.callbacks.ModelCheckpoint\n"
+        "      init_args:\n"
+        "        monitor: null\n"
+        f"        save_top_k: {keep_last_n}\n"
+        "        save_last: true\n"
+        f"        every_n_epochs: {args.checkpoint_every_n_epochs}\n"
+        "        filename: \"periodic-epoch={epoch}-step={step}\"\n"
+    )
+
+    logs_dir = root_dir / "voice-files-out" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="periodic-checkpoint-",
+        suffix=".yaml",
+        dir=str(logs_dir),
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        handle.write(config_text)
+        return Path(handle.name)
+
+
 def train_and_export_voice(
     voice_name: str,
     clips: List[ClipOutput],
     args: argparse.Namespace,
     root_dir: Path,
     log_file: Path,
+    checkpoint_override: Path | None = None,
 ) -> None:
     voice_out_dir = root_dir / "voice-files-out" / voice_name
     voice_out_dir.mkdir(parents=True, exist_ok=True)
@@ -401,9 +468,6 @@ def train_and_export_voice(
     export_dir = voice_out_dir / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    clips_dir = clips[0].wav_path.parent
-    build_metadata_file(clips, metadata_path)
-
     piper_python = Path(args.piper_dir).expanduser() / ".venv" / "bin" / "python"
     if not piper_python.exists():
         raise PipelineError(
@@ -411,40 +475,50 @@ def train_and_export_voice(
             "Install piper1-gpl per the README or pass --piper-dir."
         )
 
-    train_cmd = [
-        str(piper_python),
-        "-m",
-        "piper.train",
-        "fit",
-        "--data.voice_name",
-        voice_name,
-        "--data.csv_path",
-        str(metadata_path),
-        "--data.audio_dir",
-        str(clips_dir),
-        "--model.sample_rate",
-        str(args.sample_rate),
-        "--data.espeak_voice",
-        args.espeak_voice,
-        "--data.cache_dir",
-        str(voice_out_dir / "cache"),
-        "--data.config_path",
-        str(config_path),
-        "--data.batch_size",
-        str(min(args.batch_size, len(clips))),
-        "--data.num_test_examples",
-        "0",
-        "--trainer.default_root_dir",
-        str(train_root),
-        "--trainer.accelerator",
-        args.trainer_accelerator,
-        "--trainer.devices",
-        str(args.trainer_devices),
-        "--trainer.max_epochs",
-        str(args.max_epochs),
-    ]
-
     if not args.export_only:
+        if not clips:
+            raise PipelineError(f"No clips available for voice: {voice_name}")
+
+        clips_dir = clips[0].wav_path.parent
+        build_metadata_file(clips, metadata_path)
+
+        train_cmd = [
+            str(piper_python),
+            "-m",
+            "piper.train",
+            "fit",
+            "--data.voice_name",
+            voice_name,
+            "--data.csv_path",
+            str(metadata_path),
+            "--data.audio_dir",
+            str(clips_dir),
+            "--model.sample_rate",
+            str(args.sample_rate),
+            "--data.espeak_voice",
+            args.espeak_voice,
+            "--data.cache_dir",
+            str(voice_out_dir / "cache"),
+            "--data.config_path",
+            str(config_path),
+            "--data.batch_size",
+            str(min(args.batch_size, len(clips))),
+            "--data.num_test_examples",
+            "0",
+            "--trainer.default_root_dir",
+            str(train_root),
+            "--trainer.accelerator",
+            args.trainer_accelerator,
+            "--trainer.devices",
+            str(args.trainer_devices),
+            "--trainer.max_epochs",
+            str(args.max_epochs),
+        ]
+
+        periodic_config_path = create_periodic_checkpoint_config(args, root_dir)
+        if periodic_config_path is not None:
+            train_cmd.extend(["-c", str(periodic_config_path)])
+
         if args.checkpoint_path:
             if args.trusted_checkpoint:
                 # Older checkpoints can fail CLI hyperparameter parsing when used as
@@ -474,6 +548,8 @@ def train_and_export_voice(
 
     if args.dry_run:
         checkpoint_path = Path(args.checkpoint_path) if args.checkpoint_path else Path("/tmp/dry-run.ckpt")
+    elif checkpoint_override is not None:
+        checkpoint_path = checkpoint_override
     else:
         checkpoint_path = find_latest_checkpoint(train_root)
         stable_checkpoint_path = save_checkpoint_copy(checkpoint_path, voice_out_dir / "latest-checkpoint.ckpt")
@@ -534,65 +610,87 @@ def main() -> int:
             f"whisper_device={args.transcribe_device}"
         )
 
-        requests = parse_requests((root_dir / args.input_csv).resolve())
-        grouped = group_by_voice(requests)
+        if args.export_only:
+            if args.voice_name:
+                voice_name = args.voice_name.strip()
+                train_root = root_dir / "voice-files-out" / voice_name / "train"
+                checkpoint_path = find_latest_checkpoint(train_root)
+            else:
+                voice_name, checkpoint_path = find_latest_voice_checkpoint(root_dir)
 
-        model = None
-        if not args.dry_run:
-            try:
-                from faster_whisper import WhisperModel
-            except ImportError as exc:
-                raise PipelineError("Missing dependency: faster-whisper. Install with pip install -r requirements.txt") from exc
+            print(f"Export-only mode: exporting voice '{voice_name}' from checkpoint {checkpoint_path}")
+            stable_checkpoint_path = save_checkpoint_copy(
+                checkpoint_path,
+                root_dir / "voice-files-out" / voice_name / "latest-checkpoint.ckpt",
+            )
+            train_and_export_voice(
+                voice_name,
+                [],
+                args,
+                root_dir,
+                log_file,
+                checkpoint_override=stable_checkpoint_path,
+            )
+        else:
+            requests = parse_requests((root_dir / args.input_csv).resolve())
+            grouped = group_by_voice(requests)
 
-            model = WhisperModel(args.whisper_model, device=args.transcribe_device)
+            model = None
+            if not args.dry_run:
+                try:
+                    from faster_whisper import WhisperModel
+                except ImportError as exc:
+                    raise PipelineError("Missing dependency: faster-whisper. Install with pip install -r requirements.txt") from exc
 
-        download_cache: Dict[str, Path] = {}
-        clips_by_voice: Dict[str, List[ClipOutput]] = defaultdict(list)
+                model = WhisperModel(args.whisper_model, device=args.transcribe_device)
 
-        for voice_name, voice_rows in grouped.items():
-            clip_dir = root_dir / "audio-samples-in" / "clips" / voice_name
-            for index, request in enumerate(voice_rows, start=1):
-                if request.youtube_url not in download_cache:
-                    download_cache[request.youtube_url] = download_audio(
-                        request.youtube_url,
-                        root_dir / "audio-samples-in" / "raw-youtube",
+            download_cache: Dict[str, Path] = {}
+            clips_by_voice: Dict[str, List[ClipOutput]] = defaultdict(list)
+
+            for voice_name, voice_rows in grouped.items():
+                clip_dir = root_dir / "audio-samples-in" / "clips" / voice_name
+                for index, request in enumerate(voice_rows, start=1):
+                    if request.youtube_url not in download_cache:
+                        download_cache[request.youtube_url] = download_audio(
+                            request.youtube_url,
+                            root_dir / "audio-samples-in" / "raw-youtube",
+                            args.dry_run,
+                            log_file,
+                        )
+
+                    source_audio = download_cache[request.youtube_url]
+                    clip_name = f"{voice_name}_{index:04d}.wav"
+                    wav_path = clip_dir / clip_name
+                    clip_audio(
+                        source_audio,
+                        wav_path,
+                        request.start_seconds,
+                        request.end_seconds,
+                        args.sample_rate,
+                        args.dry_run,
+                        log_file,
+                    )
+                    validate_clip_duration(
+                        wav_path,
+                        args.min_duration,
+                        args.max_duration,
                         args.dry_run,
                         log_file,
                     )
 
-                source_audio = download_cache[request.youtube_url]
-                clip_name = f"{voice_name}_{index:04d}.wav"
-                wav_path = clip_dir / clip_name
-                clip_audio(
-                    source_audio,
-                    wav_path,
-                    request.start_seconds,
-                    request.end_seconds,
-                    args.sample_rate,
-                    args.dry_run,
-                    log_file,
-                )
-                validate_clip_duration(
-                    wav_path,
-                    args.min_duration,
-                    args.max_duration,
-                    args.dry_run,
-                    log_file,
-                )
+                    transcript = "dry run transcript"
+                    if not args.dry_run:
+                        transcript = transcribe_clip(model, wav_path)
+                    transcript = sanitize_transcript(transcript)
+                    if not transcript:
+                        raise PipelineError(f"Transcript is empty for {wav_path.name}")
 
-                transcript = "dry run transcript"
-                if not args.dry_run:
-                    transcript = transcribe_clip(model, wav_path)
-                transcript = sanitize_transcript(transcript)
-                if not transcript:
-                    raise PipelineError(f"Transcript is empty for {wav_path.name}")
+                    clips_by_voice[voice_name].append(
+                        ClipOutput(voice_name=voice_name, wav_path=wav_path, transcript=transcript)
+                    )
 
-                clips_by_voice[voice_name].append(
-                    ClipOutput(voice_name=voice_name, wav_path=wav_path, transcript=transcript)
-                )
-
-        for voice_name, clips in clips_by_voice.items():
-            train_and_export_voice(voice_name, clips, args, root_dir, log_file)
+            for voice_name, clips in clips_by_voice.items():
+                train_and_export_voice(voice_name, clips, args, root_dir, log_file)
 
         print("Pipeline completed successfully.")
         print(f"Log file: {log_file}")

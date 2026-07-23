@@ -112,8 +112,12 @@ That is the minimum you need. The pipeline uses sensible defaults for everything
 | `--sample-rate` | `22050` | Audio sample rate in Hz |
 | `--batch-size` | `32` | Training batch size — lower this if you run out of memory |
 | `--max-epochs` | `100` | Maximum training epochs — use `-1` for unlimited |
+| `--checkpoint-every-n-epochs` | `10` | Save an extra periodic checkpoint every N epochs (set `0` to disable) |
+| `--checkpoint-keep-last-n` | `5` | Number of periodic checkpoints to retain |
 | `--trainer-accelerator` | `cpu` | `cpu` or `gpu` |
 | `--trainer-devices` | `1` | Number of GPUs to use |
+| `--voice-name` | *(latest checkpoint voice)* | Voice name used by `--export-only`; if omitted, exports the most recently updated checkpoint across voices |
+| `--export-only` | *(off)* | Skip download/transcribe/train and export ONNX from latest checkpoint |
 | `--dry-run` | *(off)* | Preview actions without running them |
 
 ---
