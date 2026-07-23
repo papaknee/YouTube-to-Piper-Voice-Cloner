@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import shutil
 import subprocess
@@ -60,6 +61,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32, help="Piper training batch size")
     parser.add_argument("--max-epochs", type=int, default=100, help="Maximum training epochs passed to Piper's trainer (use -1 for unlimited)")
     parser.add_argument("--checkpoint-path", default="", help="Optional Piper checkpoint path (recommended for faster convergence)")
+    parser.add_argument(
+        "--trusted-checkpoint",
+        action="store_true",
+        help=(
+            "Trust checkpoint pickle contents and disable PyTorch weights-only safe loading for Piper subprocesses. "
+            "Use only with trusted checkpoint sources."
+        ),
+    )
     parser.add_argument("--whisper-model", default="base", help="faster-whisper model name")
     parser.add_argument("--transcribe-device", default="auto", choices=["auto", "cpu", "cuda"], help="faster-whisper device")
     parser.add_argument(
@@ -175,6 +184,7 @@ def run_command(
     cwd: Path | None = None,
     log_file: Path | None = None,
     stream_output: bool = False,
+    env: Dict[str, str] | None = None,
 ) -> str:
     printable = " ".join(cmd)
     print(f"$ {printable}")
@@ -191,6 +201,7 @@ def run_command(
         result = subprocess.run(
             cmd,
             cwd=str(cwd) if cwd else None,
+            env={**os.environ, **env} if env else None,
             check=False,
         )
         if result.returncode != 0:
@@ -200,6 +211,7 @@ def run_command(
     process = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
+        env={**os.environ, **env} if env else None,
         check=False,
         text=True,
         capture_output=True,
@@ -403,7 +415,71 @@ def train_and_export_voice(
     else:
         print("Warning: --checkpoint-path not provided. Piper recommends fine-tuning from an existing checkpoint.")
 
-    run_command(train_cmd, dry_run=args.dry_run, cwd=root_dir, log_file=log_file, stream_output=True)
+    trusted_checkpoint_env: Dict[str, str] | None = None
+    if args.trusted_checkpoint:
+        if not args.checkpoint_path:
+            print("Warning: --trusted-checkpoint was set, but --checkpoint-path is empty. Flag will be ignored.")
+        else:
+            # PyTorch >=2.6 defaults to weights_only checkpoint loading; older
+            # checkpoint files can require full pickle loading.
+            trusted_checkpoint_env = {"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
+            train_cmd = [
+                str(piper_python),
+                "-c",
+                (
+                    "import runpy, sys, torch; "
+                    "_orig_torch_load = torch.load; "
+                    "def _trusted_load(*args, **kwargs): "
+                    " kwargs['weights_only'] = False; "
+                    " return _orig_torch_load(*args, **kwargs); "
+                    "torch.load = _trusted_load; "
+                    "sys.argv=['piper.train'] + sys.argv[1:]; "
+                    "runpy.run_module('piper.train.__main__', run_name='__main__')"
+                ),
+                "fit",
+                "--data.voice_name",
+                voice_name,
+                "--data.csv_path",
+                str(metadata_path),
+                "--data.audio_dir",
+                str(clips_dir),
+                "--model.sample_rate",
+                str(args.sample_rate),
+                "--data.espeak_voice",
+                args.espeak_voice,
+                "--data.cache_dir",
+                str(voice_out_dir / "cache"),
+                "--data.config_path",
+                str(config_path),
+                "--data.batch_size",
+                str(min(args.batch_size, len(clips))),
+                "--data.num_test_examples",
+                "0",
+                "--trainer.default_root_dir",
+                str(train_root),
+                "--trainer.accelerator",
+                args.trainer_accelerator,
+                "--trainer.devices",
+                str(args.trainer_devices),
+                "--trainer.max_epochs",
+                str(args.max_epochs),
+                "--ckpt_path",
+                args.checkpoint_path,
+            ]
+            print(
+                "Warning: trusted checkpoint mode enabled. "
+                "Forcing torch.load(weights_only=False) for Piper checkpoint load. "
+                "Use only for trusted checkpoint sources."
+            )
+
+    run_command(
+        train_cmd,
+        dry_run=args.dry_run,
+        cwd=root_dir,
+        log_file=log_file,
+        stream_output=True,
+        env=trusted_checkpoint_env,
+    )
 
     if args.dry_run:
         checkpoint_path = Path(args.checkpoint_path) if args.checkpoint_path else Path("/tmp/dry-run.ckpt")
