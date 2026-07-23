@@ -110,6 +110,7 @@ That is the minimum you need. The pipeline uses sensible defaults for everything
 | `--language-code` | `en` | Language code used in output filenames |
 | `--sample-rate` | `22050` | Audio sample rate in Hz |
 | `--batch-size` | `32` | Training batch size — lower this if you run out of memory |
+| `--max-epochs` | `100` | Maximum training epochs — use `-1` for unlimited |
 | `--trainer-accelerator` | `cpu` | `cpu` or `gpu` |
 | `--trainer-devices` | `1` | Number of GPUs to use |
 | `--dry-run` | *(off)* | Preview actions without running them |

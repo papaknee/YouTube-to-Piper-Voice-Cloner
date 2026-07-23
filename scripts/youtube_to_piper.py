@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language-code", default="en", help="Language code for exported model name")
     parser.add_argument("--sample-rate", type=int, default=22050, help="Audio sample rate")
     parser.add_argument("--batch-size", type=int, default=32, help="Piper training batch size")
+    parser.add_argument("--max-epochs", type=int, default=100, help="Maximum training epochs passed to Piper's trainer (use -1 for unlimited)")
     parser.add_argument("--checkpoint-path", default="", help="Optional Piper checkpoint path (recommended for faster convergence)")
     parser.add_argument("--whisper-model", default="base", help="faster-whisper model name")
     parser.add_argument("--transcribe-device", default="auto", choices=["auto", "cpu", "cuda"], help="faster-whisper device")
@@ -393,6 +394,8 @@ def train_and_export_voice(
         args.trainer_accelerator,
         "--trainer.devices",
         str(args.trainer_devices),
+        "--trainer.max_epochs",
+        str(args.max_epochs),
     ]
 
     if args.checkpoint_path:
