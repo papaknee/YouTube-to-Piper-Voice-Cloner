@@ -1,6 +1,2 @@
 voice_name	youtube_url	start_timestamp	end_timestamp
-dolly	https://youtu.be/qynJAM2snSA?si=RSu9qAHPfmv85vbI	00:01:14	00:01:44
-dolly	https://youtu.be/qynJAM2snSA?si=RSu9qAHPfmv85vbI	00:01:44	00:01:56
-dolly	https://youtu.be/qynJAM2snSA?si=RSu9qAHPfmv85vbI	00:01:56	00:02:48
-dolly	https://youtu.be/qynJAM2snSA?si=RSu9qAHPfmv85vbI	00:05:49	00:06:22
-dolly	https://youtu.be/qynJAM2snSA?si=RSu9qAHPfmv85vbI	00:06:42	00:07:27
+dolly_long_sample	https://youtu.be/qynJAM2snSA?si=RSu9qAHPfmv85vbI	00:01:14	00:10:49

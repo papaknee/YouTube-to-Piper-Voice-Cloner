@@ -10,9 +10,10 @@ You provide a CSV file listing YouTube URLs and timestamps. The pipeline:
 
 1. Downloads each clip from YouTube
 2. Trims it to the timestamps you specified
-3. Transcribes the audio
-4. Trains a [Piper](https://github.com/OHF-Voice/piper1-gpl) voice model
-5. Exports a `.onnx` voice file you can load into any Piper-compatible TTS app
+3. Automatically splits long clips into speech-aligned snippets (default target: 10-30 seconds)
+4. Transcribes the audio
+5. Trains a [Piper](https://github.com/OHF-Voice/piper1-gpl) voice model
+6. Exports a `.onnx` voice file you can load into any Piper-compatible TTS app
 
 ---
 
@@ -78,6 +79,8 @@ You can add as many rows as you want. Rows that share the same `voice_name` are 
 
 Both comma-delimited and tab-delimited CSV files are supported.
 
+Long source windows are supported. If a trimmed clip is longer than 30 seconds, the pipeline automatically splits it into multiple speech-aware parts before generating training metadata.
+
 ---
 
 ## Run
@@ -116,6 +119,10 @@ That is the minimum you need. The pipeline uses sensible defaults for everything
 | `--checkpoint-keep-last-n` | `5` | Number of periodic checkpoints to retain (older periodic checkpoints are pruned by the pipeline) |
 | `--trainer-accelerator` | `cpu` | `cpu` or `gpu` |
 | `--trainer-devices` | `1` | Number of GPUs to use |
+| `--auto-split-long-clips` | `true` | Automatically split clips longer than `--split-max-seconds` |
+| `--split-min-seconds` | `10.0` | Target minimum duration for each auto-split part |
+| `--split-max-seconds` | `30.0` | Target maximum duration for each auto-split part |
+| `--split-tail-min-seconds` | `7.0` | Allowed minimum duration for the last part when perfect boundaries are not possible |
 | `--voice-name` | *(latest checkpoint voice)* | Voice name used by `--export-only`; if omitted, exports the most recently updated checkpoint across voices |
 | `--export-only` | *(off)* | Skip download/transcribe/train and export ONNX from latest checkpoint |
 | `--dry-run` | *(off)* | Preview actions without running them |

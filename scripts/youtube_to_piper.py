@@ -20,7 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 
 TIMESTAMP_PATTERN = re.compile(r"^(\d{2}):(\d{2}):(\d{2})$")
@@ -48,6 +48,13 @@ class ClipOutput:
     voice_name: str
     wav_path: Path
     transcript: str
+
+
+@dataclass
+class TranscriptSegment:
+    start_seconds: float
+    end_seconds: float
+    text: str
 
 
 class PipelineError(RuntimeError):
@@ -94,6 +101,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trainer-devices", default="1", help="PyTorch Lightning devices value passed to piper.train")
     parser.add_argument("--min-duration", type=float, default=1.5, help="Minimum clip duration in seconds")
     parser.add_argument("--max-duration", type=float, default=60.0, help="Maximum clip duration in seconds")
+    parser.add_argument(
+        "--auto-split-long-clips",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically split clips longer than --split-max-seconds into multiple snippets",
+    )
+    parser.add_argument(
+        "--split-min-seconds",
+        type=float,
+        default=10.0,
+        help="Target minimum duration for auto-split clip parts",
+    )
+    parser.add_argument(
+        "--split-max-seconds",
+        type=float,
+        default=30.0,
+        help="Target maximum duration for auto-split clip parts",
+    )
+    parser.add_argument(
+        "--split-tail-min-seconds",
+        type=float,
+        default=7.0,
+        help="Allowed minimum tail duration when no perfect 10-30s segmentation is possible",
+    )
     parser.add_argument("--root-dir", default=".", help="Repository root")
     parser.add_argument("--piper-dir", default="~/piper1-gpl", help="Path to the piper1-gpl install (contains .venv/)")
     parser.add_argument("--voice-name", default="", help="Voice name to export in --export-only mode (defaults to latest available voice checkpoint)")
@@ -307,6 +338,20 @@ def seconds_to_ffmpeg_time(value: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def seconds_to_ffmpeg_time_precise(value: float) -> str:
+    safe_value = max(0.0, value)
+    whole_seconds = int(safe_value)
+    milliseconds = int(round((safe_value - whole_seconds) * 1000))
+    if milliseconds >= 1000:
+        whole_seconds += 1
+        milliseconds = 0
+
+    hours = whole_seconds // 3600
+    minutes = (whole_seconds % 3600) // 60
+    seconds = whole_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
 def clip_audio(
     source_audio: Path,
     output_wav: Path,
@@ -339,6 +384,18 @@ def clip_audio(
 
 
 def validate_clip_duration(wav_path: Path, min_duration: float, max_duration: float, dry_run: bool, log_file: Path) -> None:
+    duration = probe_clip_duration(wav_path, dry_run=dry_run, log_file=log_file)
+    if dry_run:
+        return
+
+    if duration < min_duration or duration > max_duration:
+        raise PipelineError(
+            f"Clip duration out of range for {wav_path.name}: {duration:.2f}s "
+            f"(allowed {min_duration:.2f}-{max_duration:.2f}s)"
+        )
+
+
+def probe_clip_duration(wav_path: Path, dry_run: bool, log_file: Path) -> float:
     cmd = [
         "ffprobe",
         "-v",
@@ -351,18 +408,12 @@ def validate_clip_duration(wav_path: Path, min_duration: float, max_duration: fl
     ]
     output = run_command(cmd, dry_run=dry_run, log_file=log_file)
     if dry_run:
-        return
+        return 0.0
 
     try:
-        duration = float(output.strip())
+        return float(output.strip())
     except ValueError as exc:
         raise PipelineError(f"Could not read duration for clip: {wav_path}") from exc
-
-    if duration < min_duration or duration > max_duration:
-        raise PipelineError(
-            f"Clip duration out of range for {wav_path.name}: {duration:.2f}s "
-            f"(allowed {min_duration:.2f}-{max_duration:.2f}s)"
-        )
 
 
 def sanitize_transcript(text: str) -> str:
@@ -371,9 +422,164 @@ def sanitize_transcript(text: str) -> str:
 
 
 def transcribe_clip(model, wav_path: Path) -> str:
+    transcript, _ = transcribe_clip_with_segments(model, wav_path)
+    return transcript
+
+
+def transcribe_clip_with_segments(model, wav_path: Path) -> Tuple[str, List[TranscriptSegment]]:
     segments, _ = model.transcribe(str(wav_path), beam_size=5, vad_filter=True)
-    text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-    return sanitize_transcript(text)
+    parsed_segments: List[TranscriptSegment] = []
+    text_fragments: List[str] = []
+
+    for segment in segments:
+        raw_text = (segment.text or "").strip()
+        if not raw_text:
+            continue
+
+        safe_start = max(0.0, float(segment.start))
+        safe_end = max(safe_start, float(segment.end))
+        parsed_segments.append(
+            TranscriptSegment(
+                start_seconds=safe_start,
+                end_seconds=safe_end,
+                text=raw_text,
+            )
+        )
+        text_fragments.append(raw_text)
+
+    return sanitize_transcript(" ".join(text_fragments)), parsed_segments
+
+
+def pick_split_point(
+    candidates: List[float],
+    lower_bound: float,
+    upper_bound: float,
+    fallback: float,
+) -> float:
+    bounded_candidates = [point for point in candidates if lower_bound <= point <= upper_bound]
+    if not bounded_candidates:
+        return fallback
+    return max(bounded_candidates)
+
+
+def plan_split_ranges(
+    transcript_segments: List[TranscriptSegment],
+    total_duration: float,
+    min_seconds: float,
+    max_seconds: float,
+    tail_min_seconds: float,
+) -> List[Tuple[float, float]]:
+    if total_duration <= max_seconds:
+        return [(0.0, total_duration)]
+
+    candidate_boundaries = sorted(
+        {
+            max(0.0, min(total_duration, segment.end_seconds))
+            for segment in transcript_segments
+            if segment.end_seconds > 0.0 and segment.end_seconds < total_duration
+        }
+    )
+
+    ranges: List[Tuple[float, float]] = []
+    cursor = 0.0
+    epsilon = 1e-6
+
+    while total_duration - cursor > epsilon:
+        remaining = total_duration - cursor
+        if remaining <= max_seconds + epsilon:
+            ranges.append((cursor, total_duration))
+            break
+
+        lower_bound = cursor + min_seconds
+        upper_bound = min(cursor + max_seconds, total_duration)
+        chosen = pick_split_point(
+            candidate_boundaries,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            fallback=upper_bound,
+        )
+        if chosen <= cursor + epsilon:
+            chosen = upper_bound
+
+        ranges.append((cursor, chosen))
+        cursor = chosen
+
+    if len(ranges) >= 2:
+        last_start, last_end = ranges[-1]
+        last_duration = last_end - last_start
+        if last_duration < min_seconds:
+            prev_start, prev_end = ranges[-2]
+            prev_duration = prev_end - prev_start
+
+            if prev_duration + last_duration <= max_seconds:
+                ranges[-2] = (prev_start, last_end)
+                ranges.pop()
+            elif last_duration < tail_min_seconds:
+                target_boundary = max(
+                    prev_start + min_seconds,
+                    last_end - min_seconds,
+                )
+                shifted_boundary = pick_split_point(
+                    candidate_boundaries,
+                    lower_bound=prev_start + min_seconds,
+                    upper_bound=min(prev_start + max_seconds, last_end - min_seconds),
+                    fallback=target_boundary,
+                )
+                shifted_boundary = max(prev_start + min_seconds, shifted_boundary)
+                shifted_boundary = min(last_end - min_seconds, shifted_boundary)
+                if shifted_boundary > prev_start and shifted_boundary < last_end:
+                    ranges[-2] = (prev_start, shifted_boundary)
+                    ranges[-1] = (shifted_boundary, last_end)
+
+    normalized: List[Tuple[float, float]] = []
+    for start, end in ranges:
+        safe_start = max(0.0, min(total_duration, start))
+        safe_end = max(safe_start, min(total_duration, end))
+        if safe_end - safe_start > epsilon:
+            normalized.append((safe_start, safe_end))
+
+    if not normalized:
+        return [(0.0, total_duration)]
+    return normalized
+
+
+def split_clip_by_ranges(
+    source_wav: Path,
+    ranges: List[Tuple[float, float]],
+    sample_rate: int,
+    dry_run: bool,
+    log_file: Path,
+) -> List[Path]:
+    if len(ranges) <= 1:
+        return [source_wav]
+
+    part_paths: List[Path] = []
+    stem = source_wav.stem
+
+    for index, (start_seconds, end_seconds) in enumerate(ranges, start=1):
+        part_path = source_wav.with_name(f"{stem}_part{index:02d}.wav")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            seconds_to_ffmpeg_time_precise(start_seconds),
+            "-to",
+            seconds_to_ffmpeg_time_precise(end_seconds),
+            "-i",
+            str(source_wav),
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            str(part_path),
+        ]
+        run_command(cmd, dry_run=dry_run, log_file=log_file)
+        part_paths.append(part_path)
+
+    return part_paths
 
 
 def find_latest_checkpoint(search_dir: Path) -> Path:
@@ -700,6 +906,13 @@ def main() -> int:
     args = parse_args()
     root_dir = Path(args.root_dir).resolve()
 
+    if args.split_min_seconds <= 0 or args.split_max_seconds <= 0:
+        raise SystemExit("--split-min-seconds and --split-max-seconds must be positive")
+    if args.split_min_seconds > args.split_max_seconds:
+        raise SystemExit("--split-min-seconds must be less than or equal to --split-max-seconds")
+    if args.split_tail_min_seconds <= 0:
+        raise SystemExit("--split-tail-min-seconds must be positive")
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = root_dir / "voice-files-out" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -783,24 +996,57 @@ def main() -> int:
                         args.dry_run,
                         log_file,
                     )
-                    validate_clip_duration(
-                        wav_path,
-                        args.min_duration,
-                        args.max_duration,
-                        args.dry_run,
-                        log_file,
-                    )
+                    clip_duration = probe_clip_duration(wav_path, args.dry_run, log_file)
+                    split_paths: List[Path] = [wav_path]
+                    first_pass_transcript = ""
 
-                    transcript = "dry run transcript"
-                    if not args.dry_run:
-                        transcript = transcribe_clip(model, wav_path)
-                    transcript = sanitize_transcript(transcript)
-                    if not transcript:
-                        raise PipelineError(f"Transcript is empty for {wav_path.name}")
+                    if (
+                        args.auto_split_long_clips
+                        and not args.dry_run
+                        and clip_duration > args.split_max_seconds
+                    ):
+                        first_pass_transcript, initial_segments = transcribe_clip_with_segments(model, wav_path)
+                        planned_ranges = plan_split_ranges(
+                            initial_segments,
+                            clip_duration,
+                            min_seconds=args.split_min_seconds,
+                            max_seconds=args.split_max_seconds,
+                            tail_min_seconds=args.split_tail_min_seconds,
+                        )
+                        split_paths = split_clip_by_ranges(
+                            wav_path,
+                            planned_ranges,
+                            args.sample_rate,
+                            args.dry_run,
+                            log_file,
+                        )
 
-                    clips_by_voice[voice_name].append(
-                        ClipOutput(voice_name=voice_name, wav_path=wav_path, transcript=transcript)
-                    )
+                    for split_index, split_path in enumerate(split_paths, start=1):
+                        validate_clip_duration(
+                            split_path,
+                            args.min_duration,
+                            args.max_duration,
+                            args.dry_run,
+                            log_file,
+                        )
+
+                        transcript = "dry run transcript"
+                        if not args.dry_run:
+                            if len(split_paths) == 1 and first_pass_transcript:
+                                transcript = first_pass_transcript
+                            else:
+                                transcript = transcribe_clip(model, split_path)
+
+                        transcript = sanitize_transcript(transcript)
+                        if not transcript:
+                            part_label = ""
+                            if len(split_paths) > 1:
+                                part_label = f" (part {split_index})"
+                            raise PipelineError(f"Transcript is empty for {split_path.name}{part_label}")
+
+                        clips_by_voice[voice_name].append(
+                            ClipOutput(voice_name=voice_name, wav_path=split_path, transcript=transcript)
+                        )
 
             for voice_name, clips in clips_by_voice.items():
                 train_and_export_voice(voice_name, clips, args, root_dir, log_file)
