@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -68,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language-code", default="en", help="Language code for exported model name")
     parser.add_argument("--sample-rate", type=int, default=22050, help="Audio sample rate")
     parser.add_argument("--batch-size", type=int, default=32, help="Piper training batch size")
+    parser.add_argument(
+        "--validation-split",
+        type=float,
+        default=0.1,
+        help="Fraction of clips reserved for validation by Piper (0.0 disables validation set)",
+    )
     parser.add_argument("--max-epochs", type=int, default=100, help="Maximum training epochs passed to Piper's trainer (use -1 for unlimited)")
     parser.add_argument(
         "--checkpoint-every-n-epochs",
@@ -787,8 +794,33 @@ def train_and_export_voice(
         if not clips:
             raise PipelineError(f"No clips available for voice: {voice_name}")
 
+        if args.validation_split < 0.0 or args.validation_split >= 1.0:
+            raise PipelineError("--validation-split must be in the range [0.0, 1.0)")
+
         clips_dir = clips[0].wav_path.parent
         build_metadata_file(clips, metadata_path)
+
+        total_clips = len(clips)
+        # Piper keeps a validation partition; cap batch size to estimated train rows
+        # to avoid zero training batches when clip counts are small.
+        validation_count = 0
+        if args.validation_split > 0.0 and total_clips > 1:
+            validation_count = max(1, math.ceil(total_clips * args.validation_split))
+            validation_count = min(validation_count, total_clips - 1)
+        estimated_train_count = total_clips - validation_count
+        if estimated_train_count <= 0:
+            raise PipelineError(
+                f"No training samples available after validation split. "
+                f"clips={total_clips}, validation_split={args.validation_split}."
+            )
+
+        effective_batch_size = min(args.batch_size, estimated_train_count)
+        if effective_batch_size != args.batch_size:
+            print(
+                "Adjusting batch size to avoid empty training batches: "
+                f"requested={args.batch_size}, effective={effective_batch_size}, "
+                f"estimated_train_samples={estimated_train_count}."
+            )
 
         train_cmd = [
             str(piper_python),
@@ -810,7 +842,9 @@ def train_and_export_voice(
             "--data.config_path",
             str(config_path),
             "--data.batch_size",
-            str(min(args.batch_size, len(clips))),
+            str(effective_batch_size),
+            "--data.validation_split",
+            str(args.validation_split),
             "--data.num_test_examples",
             "0",
             "--trainer.default_root_dir",

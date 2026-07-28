@@ -114,6 +114,7 @@ That is the minimum you need. The pipeline uses sensible defaults for everything
 | `--language-code` | `en` | Language code used in output filenames |
 | `--sample-rate` | `22050` | Audio sample rate in Hz |
 | `--batch-size` | `32` | Training batch size — lower this if you run out of memory |
+| `--validation-split` | `0.1` | Fraction of clips reserved for validation by Piper (`0.0` disables validation split) |
 | `--max-epochs` | `100` | Maximum training epochs — use `-1` for unlimited |
 | `--checkpoint-every-n-epochs` | `10` | Save an extra periodic checkpoint every N epochs (set `0` to disable) |
 | `--checkpoint-keep-last-n` | `5` | Number of periodic checkpoints to retain (older periodic checkpoints are pruned by the pipeline) |
