@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
@@ -382,6 +383,92 @@ def find_latest_checkpoint(search_dir: Path) -> Path:
     return checkpoints[-1]
 
 
+# Generator-architecture hyperparameters that must match between a checkpoint's
+# saved weights and the model built for this run. Piper's Lightning CLI
+# normally restores these automatically from --ckpt_path, but that recovery
+# silently fails for older checkpoints containing hyperparameter keys the
+# current CLI no longer accepts (e.g. "sample_bytes"), so the Trainer falls
+# back to default ("medium") architecture and then fails to load the
+# checkpoint's weights with a shape mismatch. Reading the checkpoint directly
+# and passing the architecture explicitly avoids relying on that recovery.
+CHECKPOINT_ARCHITECTURE_KEYS = (
+    "resblock",
+    "resblock_kernel_sizes",
+    "resblock_dilation_sizes",
+    "upsample_rates",
+    "upsample_initial_channel",
+    "upsample_kernel_sizes",
+    "inter_channels",
+    "hidden_channels",
+    "filter_channels",
+    "n_heads",
+    "n_layers",
+    "kernel_size",
+    "p_dropout",
+    "n_layers_q",
+    "use_spectral_norm",
+    "gin_channels",
+    "use_sdp",
+    "segment_size",
+    "filter_length",
+    "hop_length",
+    "win_length",
+    "mel_channels",
+    "mel_fmin",
+    "mel_fmax",
+    "num_symbols",
+)
+
+# Keys that live under the `--data.*` CLI group instead of `--model.*`.
+CHECKPOINT_DATA_GROUP_KEYS = {"num_symbols"}
+
+
+def read_checkpoint_architecture(piper_python: Path, checkpoint_path: Path) -> Dict[str, object]:
+    """Read generator-architecture hyperparameters saved inside a checkpoint.
+
+    Runs in the Piper training environment (via piper_python) since torch is
+    not installed in this pipeline's own environment.
+    """
+    snippet = (
+        "import json, torch\n"
+        f"ckpt = torch.load({str(checkpoint_path)!r}, map_location='cpu', weights_only=False)\n"
+        "hp = ckpt.get('hyper_parameters', {})\n"
+        f"keys = {CHECKPOINT_ARCHITECTURE_KEYS!r}\n"
+        "print(json.dumps({k: hp[k] for k in keys if k in hp}))\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(piper_python), "-c", snippet],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return json.loads(result.stdout.strip() or "{}")
+    except Exception as exc:
+        print(
+            f"Warning: could not read architecture hyperparameters from checkpoint {checkpoint_path} ({exc}). "
+            "Falling back to CLI-restored/default architecture."
+        )
+        return {}
+
+
+def checkpoint_architecture_cli_args(hparams: Dict[str, object]) -> List[str]:
+    args: List[str] = []
+    for key, value in hparams.items():
+        flag = f"--data.{key}" if key in CHECKPOINT_DATA_GROUP_KEYS else f"--model.{key}"
+        if isinstance(value, bool):
+            args.extend([flag, "true" if value else "false"])
+        elif value is None:
+            args.extend([flag, "null"])
+        elif isinstance(value, str):
+            # Passed directly (no shell involved): avoid json.dumps here, which
+            # would wrap the value in literal quote characters.
+            args.extend([flag, value])
+        else:
+            args.extend([flag, json.dumps(value)])
+    return args
+
+
 def find_latest_voice_checkpoint(root_dir: Path) -> tuple[str, Path]:
     voice_root = root_dir / "voice-files-out"
     candidates: List[tuple[str, Path]] = []
@@ -535,6 +622,14 @@ def train_and_export_voice(
             train_cmd.extend(["-c", str(periodic_config_path)])
 
         if args.checkpoint_path:
+            checkpoint_hparams = read_checkpoint_architecture(piper_python, Path(args.checkpoint_path))
+            if checkpoint_hparams:
+                print(
+                    "Applying generator architecture from checkpoint hyperparameters: "
+                    f"{checkpoint_hparams}"
+                )
+                train_cmd.extend(checkpoint_architecture_cli_args(checkpoint_hparams))
+
             if args.trusted_checkpoint:
                 # Older checkpoints can fail CLI hyperparameter parsing when used as
                 # ckpt_path. Warmstart loads model weights and skips resume parsing.
